@@ -2,17 +2,6 @@
 // https://github.com/adafruit/Adafruit_Python_DHT/blob/8f5e2c4d6ebba8836f6d31ec9a0c171948e3237d/source/Raspberry_Pi_2/pi_2_dht_read.c
 #include "dht22.hh"
 
-// This is the only processor specific magic value, the maximum amount of time to
-// spin in a loop before bailing out and considering the read a timeout.  This should
-// be a high value, but if you're running on a much faster platform than a Raspberry
-// Pi or Beaglebone Black then it might need to be increased.
-#define DHT_MAXCOUNT 320000
-
-// Number of bit pulses to expect from the DHT.  Note that this is 41 because
-// the first pulse is a constant 50 microsecond pulse, with 40 pulses to represent
-// the data afterwards.
-#define DHT_PULSES 41
-
 Nan::Persistent<v8::Function> DHT22::constructor;
 
 NAN_MODULE_INIT(DHT22::Init)
@@ -40,17 +29,18 @@ DHT22::DHT22(const char *device, unsigned int pin)
 
 DHT22::~DHT22()
 {
-  if (line)
-  {
-    gpiod_line_close_chip(line);
-    line = NULL;
-  }
+  // TODO: i think these are causing segfaults
+  // if (line)
+  // {
+  //   gpiod_line_close_chip(line);
+  //   line = NULL;
+  // }
 
-  if (chip)
-  {
-    gpiod_chip_close(chip);
-    chip = NULL;
-  }
+  // if (chip)
+  // {
+  //   gpiod_chip_close(chip);
+  //   chip = NULL;
+  // }
 }
 
 NAN_METHOD(DHT22::New)
@@ -76,10 +66,36 @@ NAN_METHOD(DHT22::New)
 
 NAN_METHOD(DHT22::read)
 {
+  // according to the DHT22 (AM2303) data sheet found here:
+  // https://cdn-shop.adafruit.com/datasheets/DHT22.pdf
+  //
+  // the AM2303 transmits the current temperature and humidity via a single
+  // signal data bus.
+  //
+  // process:
+  // - STEP 1: HOST START signal - we pull the pin high for 500ms then pull it
+  //   low. this will tell the sensor we're requesting a reading
+  // - STEP 2: SENSOR ACK signal — we wait for the sensor to acknowledge the
+  //   request by waiting up to 40us for the sensor to pull the pin high (but no
+  //   quicker than ~20us). the sensor will leave the pin high for 80us then
+  //   pull it low again for another 80ms.
+  // - STEP 3: LISTEN - the AM2303 sends 40 bits of data over the pin by a
+  //   series of pulses. the AM2303 starts each bit transmission by
+  //   pulling the pin high for 50ms then pulling it low for either:
+  //   - 25us to transmit a 0 bit
+  //   - 70us to transmit a 1 bit
+  // - STEP 4: DECODE and verify - the 40 bits represent 5 bytes of data in the
+  //   following order can be interpreted as following:
+  //   - 8 bits integral humidity data
+  //   - 8 bits decimal humidity data
+  //   - 8 bits integral temperature data
+  //   - 8 bits decimal temperature data
+  //   - 8 bits for a checksum
   DHT22 *obj = Nan::ObjectWrap::Unwrap<DHT22>(info.This());
 
   Nan::Utf8String consumer(info[0]);
 
+  // STEP 1: HOST START
   // request pin output mode
   if (gpiod_line_request_output(obj->line, *consumer, 0) == -1)
     Nan::ThrowError("Could not get output mode for given pin");
@@ -88,96 +104,63 @@ NAN_METHOD(DHT22::read)
   gpiod_line_set_value(obj->line, 1);
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-  // set pin low for 20ms.
+  // set pin low and wait
   gpiod_line_set_value(obj->line, 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  gpiod_line_set_value(obj->line, 1);
 
-  gpiod_line_release(obj->line);
+  // STEP 2: SENSOR ACK signal
+  // we ignore these pulses
 
-  // request pin input mode
-  if (gpiod_line_request_input(obj->line, *consumer) == -1)
-    Nan::ThrowError("Could not get input mode for given pin");
-
-  // need a very short delay before reading pins or else value is sometimes still low.
-  for (volatile int i = 0; i < 50; ++i)
+  while (!gpiod_line_get_value(obj->line))
   {
   }
 
-  // wait for DHT to pull pin low.
-  uint32_t count = 0;
   while (gpiod_line_get_value(obj->line))
   {
-    if (++count >= DHT_MAXCOUNT)
-    {
-      // timeout waiting for response.
-      gpiod_line_release(obj->line);
-      Nan::ThrowError("Timeout waiting for sensor");
-      return;
-    }
   }
 
-  // store the count that each DHT bit pulse is low and high.
-  // make sure array is initialized to start at zero.
-  unsigned int pulseCounts[DHT_PULSES * 2] = {0};
+  bool bits[40] = {0};
+  int expected_pulses = 40;
 
-  // record pulse widths for the expected result bits.
-  for (int i = 0; i < DHT_PULSES * 2; i += 2)
+  for (int i = 0; i < expected_pulses; i++)
   {
-    // count how long pin is low and store in pulseCounts[i]
+    int count_0 = 0;
+    int count_1 = 0;
+
     while (!gpiod_line_get_value(obj->line))
     {
-      if (++pulseCounts[i] >= DHT_MAXCOUNT)
-      {
-        // timeout waiting for response.
-        gpiod_line_release(obj->line);
-        Nan::ThrowError("Timeout while reading response from sensor");
-        return;
-      }
+      count_0++;
     }
 
-    // count how long pin is high and store in pulseCounts[i+1]
     while (gpiod_line_get_value(obj->line))
     {
-      if (++pulseCounts[i + 1] >= DHT_MAXCOUNT)
+      count_1++;
+    }
+
+    // if the number of high cycles exists twice the amount of low then
+    // we assume that's an on bit
+    bool bit = (float)count_1 / (float)count_0 > 2.0;
+    bits[i] = bit;
+
+    // this is required actually idky
+    std::cout << "0s: ";
+    std::cout << count_0;
+    std::cout << " 1s: ";
+    std::cout << count_1;
+    std::cout << "\n";
+  }
+
+  uint8_t data[5] = {0};
+  for (int byte_index = 0; byte_index < 5; byte_index++)
+  {
+    int offset = byte_index * 8;
+    for (int i = 0; i < 8; i++)
+    {
+      if (bits[offset + i])
       {
-        // timeout waiting for response.
-        gpiod_line_release(obj->line);
-        Nan::ThrowError("Timeout while reading response from sensor");
-        return;
+        data[byte_index] = data[byte_index] + (1 << (7 - i));
       }
     }
   }
-
-  // done with timing critical code, now interpret the results.
-
-  // compute the average low pulse width to use as a 50 microsecond reference threshold.
-  // ignore the first two readings because they are a constant 80 microsecond pulse.
-  unsigned int threshold = 0;
-  for (int i = 2; i < DHT_PULSES * 2; i += 2)
-  {
-    threshold += pulseCounts[i];
-  }
-  threshold /= DHT_PULSES - 1;
-
-  // interpret each high pulse as a 0 or 1 by comparing it to the 50us reference.
-  // if the count is less than 50us it must be a ~28us 0 pulse, and if it's higher
-  // then it must be a ~70us 1 pulse.
-  uint8_t data[5] = {0};
-  for (int i = 3; i < DHT_PULSES * 2; i += 2)
-  {
-    int index = (i - 3) / 16;
-    data[index] <<= 1;
-    if (pulseCounts[i] >= threshold)
-    {
-      // one bit for long pulse.
-      data[index] |= 1;
-    }
-    // else zero bit for short pulse.
-  }
-
-  // // useful debug info:
-  // printf("Data: 0x%x 0x%x 0x%x 0x%x 0x%x\n", data[0], data[1], data[2], data[3], data[4]);
 
   // verify checksum of received data.
   if (data[4] != ((data[0] + data[1] + data[2] + data[3]) & 0xFF))
@@ -187,12 +170,16 @@ NAN_METHOD(DHT22::read)
   }
 
   // Calculate humidity and temp for DHT22 sensor.
-  // float humidity = (data[0] * 256 + data[1]) / 10.0f;
+  float humidity = (data[0] * 256 + data[1]) / 10.0f;
   float temperature = ((data[2] & 0x7F) * 256 + data[3]) / 10.0f;
   if (data[2] & 0x80)
   {
     temperature *= -1.0f;
   }
 
-  info.GetReturnValue().Set(temperature);
+  v8::Local<v8::Object> ret = Nan::New<v8::Object>();
+  Nan::Set(ret, Nan::New("humidity").ToLocalChecked(), Nan::New<v8::Number>(humidity));
+  Nan::Set(ret, Nan::New("temperature").ToLocalChecked(), Nan::New<v8::Number>(temperature));
+
+  info.GetReturnValue().Set(ret);
 }

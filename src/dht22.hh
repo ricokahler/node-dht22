@@ -5,6 +5,7 @@
 #include <thread>
 #include <gpiod.h>
 #include <nan.h>
+#include <iostream>
 
 class DHT22 : public Nan::ObjectWrap
 {
